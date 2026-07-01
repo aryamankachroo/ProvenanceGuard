@@ -41,6 +41,22 @@ def get_recent(limit=50):
     return entries[-limit:]
 
 
+def update_entry(content_id, updates):
+    """Merge `updates` into the entry with `content_id`. Returns it, or None."""
+    with _lock:
+        entries = _read_all()
+        target = None
+        for entry in entries:
+            if entry.get("content_id") == content_id:
+                entry.update(updates)
+                target = entry
+                break
+        if target is not None:
+            with open(LOG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(entries, fh, indent=2, ensure_ascii=False)
+        return target
+
+
 def find_by_content_id(content_id):
     """Return the entry with a given content_id, or None."""
     with _lock:

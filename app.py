@@ -1,13 +1,12 @@
 """Provenance Guard — Flask application.
 
-Milestone 3 scope:
-  POST /submit  -> run Signal 1 (LLM), return an attribution + placeholder
-                   confidence/label, and write a structured audit-log entry.
-  GET  /log     -> return recent audit-log entries as JSON.
-  GET  /health  -> liveness check.
-
-Confidence and label are placeholders until Milestone 4 (second signal +
-calibrated scoring) and Milestone 5 (transparency labels).
+Endpoints:
+  POST /submit   -> run both detection signals, return attribution + calibrated
+                    confidence + transparency label; write an audit-log entry.
+  POST /appeal   -> a creator disputes a verdict; sets status to "under_review".
+  GET  /log      -> recent audit-log entries as JSON.
+  GET  /appeals  -> reviewer queue of submissions with an appeal filed.
+  GET  /health   -> liveness check.
 """
 
 import uuid
@@ -20,6 +19,7 @@ from flask_limiter.util import get_remote_address
 
 import audit_log
 from detection import combine, detect_llm, detect_stylometric
+from labels import make_label
 
 load_dotenv()
 
@@ -27,14 +27,10 @@ app = Flask(__name__)
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["60 per minute"],
+    storage_uri="memory://",
 )
 
 MAX_TEXT_CHARS = 20000
-
-PLACEHOLDER_LABEL = (
-    "Placeholder label — full transparency label is added in Milestone 5."
-)
 
 
 def _now_iso():
@@ -47,7 +43,7 @@ def health():
 
 
 @app.post("/submit")
-@limiter.limit("20 per minute")
+@limiter.limit("10 per minute;100 per day")
 def submit():
     body = request.get_json(silent=True) or {}
     text = body.get("text")
@@ -80,6 +76,7 @@ def submit():
 
     content_id = str(uuid.uuid4())
     timestamp = _now_iso()
+    label = make_label(confidence)
 
     audit_log.log_entry(
         {
@@ -92,7 +89,9 @@ def submit():
             "stylometric_score": stylometric_score,
             "reliability": combined["reliability"],
             "features": signal2["features"],
+            "label": label,
             "status": "classified",
+            "appeal_filed": False,
         }
     )
 
@@ -110,8 +109,55 @@ def submit():
                 },
             },
             "reliability": combined["reliability"],
-            "label": PLACEHOLDER_LABEL,
+            "label": label,
             "status": "classified",
+            "timestamp": timestamp,
+        }
+    )
+
+
+@app.post("/appeal")
+@limiter.limit("20 per minute")
+def appeal():
+    body = request.get_json(silent=True) or {}
+    content_id = body.get("content_id")
+    # Handout uses `creator_reasoning`; accept `reason` as an alias too.
+    creator_reasoning = body.get("creator_reasoning") or body.get("reason")
+
+    if not isinstance(content_id, str) or not content_id.strip():
+        return jsonify({"error": "Field 'content_id' is required."}), 400
+    if not isinstance(creator_reasoning, str) or not creator_reasoning.strip():
+        return jsonify({"error": "Field 'creator_reasoning' is required."}), 400
+
+    original = audit_log.find_by_content_id(content_id)
+    if original is None:
+        return jsonify({"error": f"Unknown content_id: {content_id}"}), 404
+
+    appeal_id = str(uuid.uuid4())
+    timestamp = _now_iso()
+
+    # Update the original classification record in place: flip its status and
+    # attach the appeal so it travels alongside the original decision in the log.
+    updated = audit_log.update_entry(
+        content_id,
+        {
+            "status": "under_review",
+            "appeal_filed": True,
+            "appeal_id": appeal_id,
+            "appeal_reasoning": creator_reasoning,
+            "appeal_timestamp": timestamp,
+        },
+    )
+
+    return jsonify(
+        {
+            "appeal_id": appeal_id,
+            "content_id": content_id,
+            "status": "under_review",
+            "appeal_reasoning": creator_reasoning,
+            "message": "Appeal received. This content is now under review.",
+            "original_attribution": updated.get("attribution"),
+            "original_confidence": updated.get("confidence"),
             "timestamp": timestamp,
         }
     )
@@ -121,6 +167,13 @@ def submit():
 @limiter.exempt
 def log():
     return jsonify({"entries": audit_log.get_recent()})
+
+
+@app.get("/appeals")
+@limiter.exempt
+def appeals():
+    queue = [e for e in audit_log.get_recent(limit=1000) if e.get("appeal_filed")]
+    return jsonify({"appeals": queue})
 
 
 if __name__ == "__main__":
