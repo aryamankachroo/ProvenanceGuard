@@ -9,6 +9,7 @@ Endpoints:
   GET  /health   -> liveness check.
 """
 
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -35,6 +36,25 @@ MAX_TEXT_CHARS = 20000
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+@app.get("/")
+@limiter.exempt
+def index():
+    return jsonify(
+        {
+            "service": "Provenance Guard",
+            "description": "AI-text detection with two independent signals, "
+            "calibrated confidence, transparency labels, and appeals.",
+            "endpoints": {
+                "POST /submit": "Run detection on text (body: text, creator_id)",
+                "POST /appeal": "Dispute a verdict (body: content_id, creator_reasoning)",
+                "GET /log": "Recent audit-log entries",
+                "GET /appeals": "Reviewer queue of appealed items",
+                "GET /health": "Liveness check",
+            },
+        }
+    )
 
 
 @app.get("/health")
@@ -177,4 +197,6 @@ def appeals():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    # Port is configurable (macOS AirPlay Receiver often occupies 5000).
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="127.0.0.1", port=port, debug=True)
