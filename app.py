@@ -19,7 +19,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 import audit_log
-from detection import attribution_for, detect_llm
+from detection import combine, detect_llm, detect_stylometric
 
 load_dotenv()
 
@@ -60,16 +60,23 @@ def submit():
     if len(text) > MAX_TEXT_CHARS:
         return jsonify({"error": f"Text exceeds {MAX_TEXT_CHARS} characters."}), 400
 
+    # Signal 1 (semantic, LLM) — requires network; may fail.
     try:
         signal1 = detect_llm(text)
     except RuntimeError as exc:
         return jsonify({"error": "Detection signal unavailable.", "detail": str(exc)}), 502
 
+    # Signal 2 (structural, stylometric) — pure Python, always available.
+    signal2 = detect_stylometric(text)
+
     llm_score = signal1["llm_score"]
-    # Placeholder: with only one signal, confidence mirrors the LLM score.
-    # Milestone 4 replaces this with the calibrated two-signal combination.
-    confidence = llm_score
-    attribution = attribution_for(confidence)
+    stylometric_score = signal2["stylometric_score"]
+    word_count = len(text.split())
+
+    # Calibrated two-signal confidence (planning.md section 1-2).
+    combined = combine(llm_score, stylometric_score, word_count)
+    confidence = combined["score"]
+    attribution = combined["attribution"]
 
     content_id = str(uuid.uuid4())
     timestamp = _now_iso()
@@ -82,6 +89,9 @@ def submit():
             "attribution": attribution,
             "confidence": confidence,
             "llm_score": llm_score,
+            "stylometric_score": stylometric_score,
+            "reliability": combined["reliability"],
+            "features": signal2["features"],
             "status": "classified",
         }
     )
@@ -92,8 +102,14 @@ def submit():
             "creator_id": creator_id,
             "attribution": attribution,
             "confidence": confidence,
-            "llm_score": llm_score,
-            "rationale": signal1["rationale"],
+            "signals": {
+                "llm": {"score": llm_score, "rationale": signal1["rationale"]},
+                "stylometric": {
+                    "score": stylometric_score,
+                    "features": signal2["features"],
+                },
+            },
+            "reliability": combined["reliability"],
             "label": PLACEHOLDER_LABEL,
             "status": "classified",
             "timestamp": timestamp,

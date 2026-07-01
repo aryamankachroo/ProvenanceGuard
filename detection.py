@@ -1,11 +1,14 @@
 """Detection signals for Provenance Guard.
 
-Milestone 3 implements Signal 1 (LLM classification via Groq). Signal 2
-(stylometric) and the two-signal confidence combination arrive in Milestone 4.
+Signal 1: LLM classification via Groq (semantic).
+Signal 2: stylometric heuristics in pure Python (structural).
+combine(): two-stage confidence scoring per planning.md section 1-2.
 """
 
 import json
 import os
+import re
+import statistics
 
 from groq import Groq
 
@@ -20,6 +23,36 @@ AI_MIN = 0.70
 # let a single signal express absolute certainty.
 SCORE_FLOOR = 0.05
 SCORE_CEIL = 0.95
+
+# --- Stylometric anchors & weights (planning.md section 1) ---------------------
+# Anchors were calibrated in Milestone 4 against real sample text. Each feature
+# maps to a 0-1 sub-score where 1 = more AI-like.
+BURST_HUMAN, BURST_AI = 0.55, 0.25          # coefficient of variation anchors
+MATTR_HUMAN, MATTR_AI = 0.90, 0.80          # lexical-diversity anchors (short-text range)
+PUNCT_HUMAN, PUNCT_AI = 5, 2                # distinct punctuation-type anchors
+COMPLEX_AI_CENTER, COMPLEX_SPREAD = 20, 15  # mean words/sentence anchors
+
+W_BURST, W_DIVERSITY, W_PUNCT, W_COMPLEX = 0.45, 0.20, 0.15, 0.20
+
+# --- Confidence-combination constants (planning.md section 1) ------------------
+W_LLM, W_STYLO = 0.6, 0.4          # stage-A blend weights
+LENGTH_FULL_RELIABILITY = 100      # words needed for full reliability
+LENGTH_FLOOR = 0.35                # minimum length_factor
+DISAGREE_TOLERANCE = 0.2           # disagreement below this is "in agreement"
+DISAGREE_SPAN = 0.6                # disagreement range over which trust decays
+MATTR_WINDOW = 50                  # moving-average TTR window (tokens)
+
+# Punctuation categories used for the "variety" feature.
+_PUNCT_CATEGORIES = {
+    "period": ".",
+    "comma": ",",
+    "semicolon": ";",
+    "colon": ":",
+    "dash": "—–-",
+    "exclamation": "!",
+    "question": "?",
+    "paren": "()",
+}
 
 _SYSTEM_PROMPT = (
     "You are a forensic linguistics classifier that estimates whether a passage "
@@ -98,29 +131,209 @@ def attribution_for(score):
     return "uncertain"
 
 
+# --- Signal 2: stylometric heuristics -----------------------------------------
+
+_SENTENCE_SPLIT = re.compile(r"[.!?]+")
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+
+
+def _sentences(text):
+    return [s for s in (part.strip() for part in _SENTENCE_SPLIT.split(text)) if s]
+
+
+def _words(text):
+    return _WORD_RE.findall(text)
+
+
+def _mattr(tokens, window=MATTR_WINDOW):
+    """Moving-average type-token ratio — length-controlled lexical diversity."""
+    n = len(tokens)
+    if n == 0:
+        return 0.0
+    if n <= window:
+        return len(set(tokens)) / n
+    ratios = [
+        len(set(tokens[i : i + window])) / window
+        for i in range(n - window + 1)
+    ]
+    return sum(ratios) / len(ratios)
+
+
+def _burstiness_cv(sentences):
+    """Coefficient of variation of sentence lengths (in words)."""
+    lengths = [len(_words(s)) for s in sentences]
+    lengths = [n for n in lengths if n > 0]
+    if len(lengths) < 2:
+        return 0.0
+    mean = statistics.mean(lengths)
+    if mean == 0:
+        return 0.0
+    return statistics.pstdev(lengths) / mean
+
+
+def _punctuation_variety(text):
+    """Count how many distinct punctuation categories appear."""
+    return sum(1 for chars in _PUNCT_CATEGORIES.values() if any(c in text for c in chars))
+
+
+def detect_stylometric(text):
+    """Signal 2: structural statistics. Returns {"stylometric_score", "features"}.
+
+    Pure Python, no network. Each feature maps to a 0-1 sub-score (1 = AI-like);
+    the weighted average is the stylometric score.
+    """
+    sentences = _sentences(text)
+    tokens = [w.lower() for w in _words(text)]
+    word_count = len(tokens)
+
+    cv = _burstiness_cv(sentences)
+    mattr = _mattr(tokens)
+    punct_variety = _punctuation_variety(text)
+    mean_sentence_len = (word_count / len(sentences)) if sentences else 0.0
+
+    sub_burst = _clamp((BURST_HUMAN - cv) / (BURST_HUMAN - BURST_AI), 0.0, 1.0)
+    sub_div = _clamp((MATTR_HUMAN - mattr) / (MATTR_HUMAN - MATTR_AI), 0.0, 1.0)
+    sub_punct = _clamp((PUNCT_HUMAN - punct_variety) / (PUNCT_HUMAN - PUNCT_AI), 0.0, 1.0)
+    sub_complex = _clamp(
+        1.0 - abs(mean_sentence_len - COMPLEX_AI_CENTER) / COMPLEX_SPREAD, 0.0, 1.0
+    )
+
+    s2 = (
+        W_BURST * sub_burst
+        + W_DIVERSITY * sub_div
+        + W_PUNCT * sub_punct
+        + W_COMPLEX * sub_complex
+    )
+
+    return {
+        "stylometric_score": round(s2, 4),
+        "features": {
+            "burstiness_cv": round(cv, 4),
+            "mattr": round(mattr, 4),
+            "punctuation_variety": punct_variety,
+            "avg_sentence_length": round(mean_sentence_len, 2),
+        },
+    }
+
+
+# --- Confidence combination ----------------------------------------------------
+
+
+def combine(s1, s2, word_count):
+    """Blend the two signals into one calibrated score (planning.md section 1).
+
+    Stage A: weighted blend. Stage B: damp toward 0.5 when the text is short or
+    the signals disagree, so thin/conflicting evidence never yields a confident
+    verdict. Returns {"score", "attribution", "reliability"}.
+    """
+    raw = W_LLM * s1 + W_STYLO * s2
+
+    length_factor = _clamp(word_count / LENGTH_FULL_RELIABILITY, LENGTH_FLOOR, 1.0)
+    disagreement = abs(s1 - s2)
+    agreement_factor = 1.0 - 0.5 * _clamp(
+        (disagreement - DISAGREE_TOLERANCE) / DISAGREE_SPAN, 0.0, 1.0
+    )
+    reliability = length_factor * agreement_factor
+
+    score = _clamp(0.5 + (raw - 0.5) * reliability, 0.0, 1.0)
+    return {
+        "score": round(score, 4),
+        "attribution": attribution_for(score),
+        "reliability": round(reliability, 4),
+    }
+
+
+def _selftest_combine():
+    """Verify combine() matches the worked-examples table in planning.md."""
+    cases = [
+        # (s1, s2, words, expected_score, expected_attribution)
+        (0.90, 0.80, 300, 0.86, "likely_ai"),
+        (0.10, 0.15, 300, 0.12, "likely_human"),
+        (0.85, 0.20, 300, 0.56, "uncertain"),
+        (0.80, 0.75, 40, 0.61, "uncertain"),
+    ]
+    print("combine() self-test vs planning.md worked examples:")
+    ok = True
+    for s1, s2, words, exp_score, exp_attr in cases:
+        result = combine(s1, s2, words)
+        score_ok = abs(result["score"] - exp_score) <= 0.01
+        attr_ok = result["attribution"] == exp_attr
+        ok = ok and score_ok and attr_ok
+        flag = "OK " if (score_ok and attr_ok) else "FAIL"
+        print(
+            f"  [{flag}] s1={s1} s2={s2} words={words} -> "
+            f"score={result['score']:.2f} (exp {exp_score:.2f}) "
+            f"attr={result['attribution']} (exp {exp_attr})"
+        )
+    print("  => ALL PASSED\n" if ok else "  => SOME FAILED\n")
+    return ok
+
+
 if __name__ == "__main__":
     # Independent test harness: `python detection.py`
     from dotenv import load_dotenv
 
     load_dotenv()
 
+    _selftest_combine()
+
     samples = {
-        "human-personal": (
-            "Honestly? I burnt the toast again. Third time this week. My kitchen "
-            "smells like a campfire and the smoke alarm has opinions about my life "
-            "choices at 7am."
-        ),
         "ai-generic": (
-            "Effective time management is essential for achieving personal and "
-            "professional goals. By prioritizing tasks, setting clear objectives, "
-            "and minimizing distractions, individuals can significantly improve "
-            "their productivity and overall well-being."
+            "Artificial intelligence represents a transformative paradigm shift in "
+            "modern society. It is important to note that while the benefits of AI "
+            "are numerous, it is equally essential to consider the ethical "
+            "implications. Furthermore, stakeholders across various sectors must "
+            "collaborate to ensure responsible deployment."
+        ),
+        "human-casual": (
+            "ok so i finally tried that new ramen place downtown and honestly? "
+            "underwhelming. the broth was fine but they put WAY too much sodium in "
+            "it and i was thirsty for like three hours after. my friend got the "
+            "spicy version and said it was better. probably won't go back unless "
+            "someone drags me there"
+        ),
+        "border-formal-human": (
+            "The relationship between monetary policy and asset price inflation has "
+            "been extensively studied in the literature. Central banks face a "
+            "fundamental tension between their mandate for price stability and the "
+            "unintended consequences of prolonged low interest rates on equity and "
+            "real estate valuations."
+        ),
+        "border-edited-ai": (
+            "I've been thinking a lot about remote work lately. There are genuine "
+            "tradeoffs - flexibility and no commute on one side, isolation and "
+            "blurred work-life boundaries on the other. Studies show productivity "
+            "varies widely by individual and role type."
+        ),
+        "ai-long": (
+            "In today's rapidly evolving digital landscape, organizations must "
+            "prioritize the adoption of innovative technologies to remain "
+            "competitive. It is important to recognize that digital transformation "
+            "is not merely a technological shift but a fundamental change in "
+            "organizational culture. Companies that successfully navigate this "
+            "transition typically demonstrate strong leadership, a clear strategic "
+            "vision, and a commitment to continuous improvement. Furthermore, "
+            "investing in employee training and development is essential to ensure "
+            "that the workforce is equipped with the necessary skills. By fostering "
+            "a culture of collaboration and adaptability, businesses can position "
+            "themselves for long-term success. Ultimately, the key to thriving in "
+            "this environment lies in embracing change and leveraging data-driven "
+            "insights to inform decision-making processes across all levels of the "
+            "organization."
         ),
     }
+
+    print("Two-signal scoring on 4 deliberately chosen inputs:")
     for name, sample in samples.items():
-        result = detect_llm(sample)
+        s1 = detect_llm(sample)["llm_score"]
+        stylo = detect_stylometric(sample)
+        s2 = stylo["stylometric_score"]
+        wc = len(_words(sample))
+        result = combine(s1, s2, wc)
         print(
-            f"{name:16s} llm_score={result['llm_score']:.2f} "
-            f"attribution={attribution_for(result['llm_score'])}\n"
-            f"    rationale: {result['rationale']}\n"
+            f"\n{name}\n"
+            f"    llm_score(s1)={s1:.2f}  stylometric(s2)={s2:.2f}  words={wc}\n"
+            f"    combined={result['score']:.2f}  reliability={result['reliability']:.2f}"
+            f"  -> {result['attribution']}\n"
+            f"    features={stylo['features']}"
         )

@@ -62,7 +62,7 @@ AI-like), and takes a weighted average. Call the result **`s2`**.
 | Feature | What it computes | Sub-score mapping (1 = AI-like) | Weight |
 | --- | --- | --- | --- |
 | **Burstiness** (primary) | Coefficient of variation of sentence lengths in words, `CV = stdev/mean` | `clamp((0.55 − CV) / (0.55 − 0.25), 0, 1)` — low variance ⇒ AI-like | 0.45 |
-| **Lexical diversity** | MATTR (moving-average type-token ratio, window 50) — length-controlled | `clamp((0.78 − MATTR) / (0.78 − 0.66), 0, 1)` — low diversity ⇒ AI-like | 0.20 |
+| **Lexical diversity** | MATTR (moving-average type-token ratio, window 50) — length-controlled | `clamp((0.90 − MATTR) / (0.90 − 0.80), 0, 1)` — low diversity ⇒ AI-like | 0.20 |
 | **Punctuation variety** | Count of distinct punctuation types used, from `. , ; : — ! ? ()` | `clamp((5 − distinct) / (5 − 2), 0, 1)` — fewer types ⇒ AI-like | 0.15 |
 | **Avg sentence complexity** | Mean words per sentence | `clamp(1 − abs(mean_len − 20) / 15, 0, 1)` — ~20 wps ⇒ AI-like | 0.20 |
 
@@ -94,12 +94,16 @@ conflicting signals should *not* produce a confident verdict, so we pull the
 score toward the uncertain center (0.5):
 
 ```
-length_factor   = clamp(word_count / 150, 0.3, 1.0)
+length_factor   = clamp(word_count / 100, 0.35, 1.0)
 disagreement    = abs(s1 − s2)
 agreement_factor = 1 − 0.5·clamp((disagreement − 0.2) / 0.6, 0, 1)
 reliability      = length_factor · agreement_factor
 score            = 0.5 + (raw − 0.5)·reliability        # clamp to [0,1]
 ```
+
+*(The MATTR anchors and the length-reliability constants above were calibrated
+in Milestone 4 against real samples: short real texts have MATTR ≈ 0.87, and
+150 words was too high a bar for full reliability on normal paragraphs.)*
 
 `score` ∈ `[0,1]` is the **single calibrated confidence score** the rest of the
 system uses. Higher = more likely AI-generated.
@@ -148,7 +152,7 @@ expressed as numbers.
 | Clearly AI | 0.90 | 0.80 | 300 | 0.86 | 1.00 | **0.86** | likely AI |
 | Clearly human | 0.10 | 0.15 | 300 | 0.12 | 1.00 | **0.12** | likely human |
 | Signals conflict | 0.85 | 0.20 | 300 | 0.59 | 0.625 | **0.56** | uncertain |
-| Too short | 0.80 | 0.75 | 40 | 0.78 | 0.30 | **0.58** | uncertain |
+| Too short | 0.80 | 0.75 | 40 | 0.78 | 0.40 | **0.61** | uncertain |
 
 The last two are the point of the design: conflicting evidence and thin evidence
 both resolve to *uncertain*, never to a confident flag.

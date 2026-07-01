@@ -79,10 +79,18 @@ curl -s http://127.0.0.1:5000/log
 ```
 
 A `/submit` response includes `content_id`, `attribution` (`likely_human` /
-`uncertain` / `likely_ai`), `llm_score`, a **placeholder** `confidence`, and a
-**placeholder** `label`. Save the `content_id` — you'll need it for appeals in
-Milestone 5. Each submission also writes a structured entry to `audit_log.json`,
-readable via `GET /log`.
+`uncertain` / `likely_ai`), the calibrated `confidence` score, a per-signal
+breakdown (`signals.llm`, `signals.stylometric` with its four features), a
+`reliability` factor, and a **placeholder** `label` (finalized in Milestone 5).
+Save the `content_id` — you'll need it for appeals in Milestone 5. Each
+submission writes a structured entry (both signal scores + combined result) to
+`audit_log.json`, readable via `GET /log`.
+
+To test the detection pipeline directly (both signals + scoring self-test):
+
+```bash
+python detection.py
+```
 
 ## API endpoints
 
@@ -104,6 +112,8 @@ See [`planning.md`](./planning.md) for full request/response contracts.
 ## Status
 
 Milestones 1–2 complete (architecture + implementation-ready spec in
-[`planning.md`](./planning.md)). **Milestone 3 complete:** Flask app with
-`POST /submit`, the LLM detection signal (Groq), a structured JSON audit log,
-and `GET /log`. Confidence and label are placeholders until Milestones 4–5.
+[`planning.md`](./planning.md)). **Milestone 3:** Flask app, `POST /submit`, LLM
+signal, structured audit log, `GET /log`. **Milestone 4 complete:** second
+(stylometric) signal + calibrated two-signal confidence scoring; the audit log
+records both signal scores and the combined result. Label text is finalized in
+Milestone 5.
